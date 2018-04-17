@@ -12,6 +12,7 @@ def decision_step(rover):
     # Example:
     # Check if we have vision data to make decisions with
     if rover.nav_angles is not None:
+        print("Yay! Going ahead!")
         # Check for Rover.mode status
         if rover.mode == 'forward':
             # Check the extent of navigable terrain
@@ -25,8 +26,7 @@ def decision_step(rover):
                     rover.throttle = 0
                 rover.brake = 0
                 # Set steering to average angle clipped to the range +/- 15
-                rover.steer = np.clip(
-                    np.mean(rover.nav_angles * 180 / np.pi), -15, 15)
+                rover.steer = np.clip(  np.mean(rover.nav_angles * 180 / np.pi), -15, 15)
             # If there's a lack of navigable terrain pixels then go to 'stop' mode
             elif len(rover.nav_angles) < rover.stop_forward:
                 # Set mode to "stop" and hit the brakes!
