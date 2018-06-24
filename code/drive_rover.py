@@ -1,27 +1,32 @@
 # Do the necessary imports
 import argparse
-import os
 import shutil
-import time
+import base64
 from datetime import datetime
-
-import eventlet
-import eventlet.wsgi
-import matplotlib.image as mpimg
+import os
+import cv2
 import numpy as np
 import socketio
+import eventlet
+import eventlet.wsgi
+from PIL import Image
 from flask import Flask
+from io import BytesIO, StringIO
+import json
+import pickle
+import matplotlib.image as mpimg
+import time
 
 # Import functions for perception and decision making
 from perception import perception_step
-from supporting_functions import update_rover, create_output_images
 from decision import decision_step
+from supporting_functions import update_rover, create_output_images
 
 # Initialize socketio server and Flask application
 # (learn more at: https://python-socketio.readthedocs.io/en/latest/)
 sio = socketio.Server()
 app = Flask(__name__)
-print(os.getcwd())
+
 # Read in ground truth map and create 3-channel green version for overplotting
 # NOTE: images are read in by default with the origin (0, 0) in the upper left
 # and y-axis increasing downward.
@@ -33,10 +38,11 @@ ground_truth_3d = np.dstack((ground_truth * 0, ground_truth * 255, ground_truth 
 
 
 # Define RoverState() class to retain rover state parameters
-class RoverState:
+class RoverState():
     def __init__(self):
         self.start_time = None  # To record the start time of navigation
         self.total_time = None  # To record total duration of naviagation
+        self.start_pos = None  # Position (x, y) of the starting location
         self.img = None  # Current camera image
         self.pos = None  # Current position (x, y)
         self.yaw = None  # Current yaw angle
@@ -46,18 +52,18 @@ class RoverState:
         self.steer = 0  # Current steering angle
         self.throttle = 0  # Current throttle value
         self.brake = 0  # Current brake value
-        self.nav_angles = None  # Angles of navigable terrain pixels
-        self.nav_dists = None  # Distances of navigable terrain pixels
+        self.nav_angles = []  # Angles of navigable terrain pixels
+        self.nav_dists = []  # Distances of navigable terrain pixels
         self.ground_truth = ground_truth_3d  # Ground truth worldmap
         self.mode = 'forward'  # Current mode (can be forward or stop)
         self.throttle_set = 0.2  # Throttle setting when accelerating
-        self.brake_set = 10  # Brake setting when braking
+        self.brake_set = 5  # Brake setting when braking
         # The stop_forward and go_forward fields below represent total count
         # of navigable terrain pixels.  This is a very crude form of knowing
         # when you can keep going and when you should stop.  Feel free to
         # get creative in adding new fields or modifying these!
-        self.stop_forward = 50  # Threshold to initiate stopping
-        self.go_forward = 500  # Threshold to go forward again
+        self.stop_forward = 40  # Threshold to initiate stopping
+        self.go_forward = 41  # Threshold to go forward again
         self.max_vel = 2  # Maximum velocity (meters/second)
         # Image output from perception step
         # Update this image to display your intermediate analysis steps
@@ -69,15 +75,23 @@ class RoverState:
         self.worldmap = np.zeros((200, 200, 3), dtype=np.float)
         self.samples_pos = None  # To store the actual sample positions
         self.samples_to_find = 0  # To store the initial count of samples
-        self.samples_located = 0  # To store number of samples located on map
-        self.samples_collected = 0  # To count the number of samples collected
+        self.samples_found = 0  # To count the number of samples found
         self.near_sample = 0  # Will be set to telemetry value data["near_sample"]
+        self.sample_seen = False  # If a sample is detected, change to True
+        self.sample_max_search = 30  # Max seconds allowed to get seen sample
+        self.sample_timer = time.time()  # Time for when sample was first seen
+        self.rock_angle = []  # Tracks the angle to the sample
+        self.rock_dist = []  # Tracks the distance to the sample
         self.picking_up = 0  # Will be set to telemetry value data["picking_up"]
         self.send_pickup = False  # Set to True to trigger rock pickup
+        self.max_wheel_lock = 10  # Set max allowed sec wheels can be locked
+        self.wheel_lock = time.time()  # Time the wheels are fully turned
+        self.max_stuck = 3  # Set max allowed sec for rover to not move
+        self.stuck_time = time.time()  # Time with no velocity but throttle set
 
 
 # Initialize our rover
-rover = RoverState()
+Rover = RoverState()
 
 # Variables to track frames per second (FPS)
 # Intitialize frame counter
@@ -90,7 +104,6 @@ fps = None
 # Define telemetry function for what to do with incoming data
 @sio.on('telemetry')
 def telemetry(sid, data):
-
     global frame_counter, second_counter, fps
     frame_counter += 1
     # Do a rough calculation of frames per second (FPS)
@@ -98,38 +111,31 @@ def telemetry(sid, data):
         fps = frame_counter
         frame_counter = 0
         second_counter = time.time()
-    print("Current FPS: {}".format(fps))
+    # print("Current FPS: {}".format(fps))
 
     if data:
-        global rover
+        global Rover
         # Initialize / update Rover with current telemetry
-        rover, image = update_rover(rover, data)
+        Rover, image = update_rover(Rover, data)
 
-        if np.isfinite(rover.vel):
+        if np.isfinite(Rover.vel):
 
             # Execute the perception and decision steps to update the Rover's state
-            rover = perception_step(rover)
-            rover = decision_step(rover)
+            Rover = perception_step(Rover)
+            Rover = decision_step(Rover)
 
             # Create output images to send to server
-            out_image_string1, out_image_string2 = create_output_images(rover)
+            out_image_string1, out_image_string2 = create_output_images(Rover)
 
             # The action step!  Send commands to the rover!
-
-            # Don't send both of these, they both trigger the simulator
-            # to send back new telemetry so we must only send one
-            # back in respose to the current telemetry data.
+            commands = (Rover.throttle, Rover.brake, Rover.steer)
+            send_control(commands, out_image_string1, out_image_string2)
 
             # If in a state where want to pickup a rock send pickup command
-            if rover.send_pickup and not rover.picking_up:
+            if Rover.send_pickup and not Rover.picking_up:
                 send_pickup()
                 # Reset Rover flags
-                rover.send_pickup = False
-            else:
-                # Send commands to the rover!
-                commands = (rover.throttle, rover.brake, rover.steer)
-                send_control(commands, out_image_string1, out_image_string2)
-
+                Rover.send_pickup = False
         # In case of invalid telemetry, send null commands
         else:
 
@@ -198,7 +204,7 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    # os.system('rm -rf IMG_stream/*')
+    os.system('rm -rf IMG_stream/*')
     if args.image_folder != '':
         print("Creating image folder at {}".format(args.image_folder))
         if not os.path.exists(args.image_folder):
